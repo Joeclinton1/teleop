@@ -36,6 +36,7 @@ class TeleopUI extends HTMLElement {
                     color: white;
                     padding: 10px;
                     box-sizing: border-box;
+                    overflow-y: auto;
                 }
                 
                 .header {
@@ -88,11 +89,11 @@ class TeleopUI extends HTMLElement {
                 }
 
                 .info-section {
-                    flex: 1;
+                    flex: 0 0 auto;
                     display: flex;
                     flex-direction: column;
-                    gap: 15px;
-                    margin-bottom: 20px;
+                    gap: 10px;
+                    margin-bottom: 12px;
                 }
                 
                 .info-box {
@@ -117,17 +118,18 @@ class TeleopUI extends HTMLElement {
                 }
 
                 .axes-section {
+                    flex: 0 0 auto;
                     background: #121212;
                     border: 1px solid #333;
-                    padding: 10px;
-                    margin-bottom: 20px;
+                    padding: 8px;
+                    margin-bottom: 12px;
                 }
 
                 .axes-canvas {
                     display: block;
                     width: 100%;
-                    max-width: 420px;
-                    height: 220px;
+                    max-width: 360px;
+                    height: 160px;
                     margin: 0 auto;
                     background: #050505;
                     pointer-events: none;
@@ -237,6 +239,11 @@ class TeleopUI extends HTMLElement {
                     <button class="exit-button" id="exitButton">✕</button>
                 </div>
                 
+                <div class="axes-section">
+                    <canvas class="axes-canvas" id="axesCanvas" width="360" height="160"></canvas>
+                    <div class="axes-legend">solid=current | dim=start | X=top | Y=left | Z=screen</div>
+                </div>
+
                 <div class="info-section">
                     <div class="info-box">
                         <div class="info-title">Local Stats</div>
@@ -249,11 +256,6 @@ class TeleopUI extends HTMLElement {
                     </div>
                 </div>
 
-                <div class="axes-section">
-                    <canvas class="axes-canvas" id="axesCanvas" width="420" height="220"></canvas>
-                    <div class="axes-legend">solid=current | dim=start | X=top | Y=left | Z=screen</div>
-                </div>
-                
                 <div class="auxilary-section">
                 <div class="scale-section">
                     <input type="range" class="scale-slider" id="scaleSlider" 
