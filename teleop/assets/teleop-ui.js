@@ -9,11 +9,13 @@ class TeleopUI extends HTMLElement {
         this.motionEnabled = false;
         this.reservedButtonAActive = false;
         this.reservedButtonBActive = false;
-        this.localStats = { position: { x: 0, y: 0, z: 0 }, orientation: { x: 0, y: 0, z: 0, w: 0 }, fps: 0 };
+        this.localStats = { position: { x: 0, y: 0, z: 0 }, orientation: null, fps: 0 };
+        this.referenceOrientation = null;
         this.serverDiagnostics = {};
 
         this.createComponent();
         this.setupEventListeners();
+        this.drawAxes();
     }
 
     createComponent() {
@@ -112,6 +114,31 @@ class TeleopUI extends HTMLElement {
                     color: #ccc;
                     white-space: pre-wrap;
                     word-wrap: break-word;
+                }
+
+                .axes-section {
+                    background: #121212;
+                    border: 1px solid #333;
+                    padding: 10px;
+                    margin-bottom: 20px;
+                }
+
+                .axes-canvas {
+                    display: block;
+                    width: 100%;
+                    max-width: 420px;
+                    height: 220px;
+                    margin: 0 auto;
+                    background: #050505;
+                    pointer-events: none;
+                }
+
+                .axes-legend {
+                    margin-top: 8px;
+                    color: #aaa;
+                    font-size: 12px;
+                    font-family: monospace;
+                    text-align: center;
                 }
                 
                 .controls {
@@ -221,6 +248,11 @@ class TeleopUI extends HTMLElement {
                         <div class="info-content" id="diagnosticsContent">Waiting...</div>
                     </div>
                 </div>
+
+                <div class="axes-section">
+                    <canvas class="axes-canvas" id="axesCanvas" width="420" height="220"></canvas>
+                    <div class="axes-legend">solid=current | dim=start | X=top | Y=left | Z=screen</div>
+                </div>
                 
                 <div class="auxilary-section">
                 <div class="scale-section">
@@ -293,6 +325,8 @@ class TeleopUI extends HTMLElement {
             this.motionEnabled = true;
             motionButton.classList.add('active');
             motionButton.textContent = 'Moving...';
+            this.referenceOrientation = this.cloneOrientation(this.localStats.orientation);
+            this.drawAxes();
 
             this.dispatchEvent(new CustomEvent('motionchange', {
                 detail: { enabled: true }
@@ -365,6 +399,10 @@ class TeleopUI extends HTMLElement {
     // Public methods to update displays
     updateLocalStats(stats) {
         this.localStats = stats;
+        if (!this.referenceOrientation && stats.orientation) {
+            this.referenceOrientation = this.cloneOrientation(stats.orientation);
+        }
+
         const statsContent = this.shadowRoot.getElementById('statsContent');
 
         statsContent.textContent = '';
@@ -385,6 +423,8 @@ class TeleopUI extends HTMLElement {
             statsContent.textContent += `FPS: ${fps}
 `;
         }
+
+        this.drawAxes();
     }
 
     updateServerDiagnostics(data) {
@@ -396,6 +436,158 @@ class TeleopUI extends HTMLElement {
         } else {
             diagnosticsContent.textContent = data;
         }
+    }
+
+    cloneOrientation(orientation) {
+        if (!orientation) return null;
+        const numericOr = (value, fallback) => {
+            const numeric = Number(value);
+            return Number.isFinite(numeric) ? numeric : fallback;
+        };
+
+        return {
+            x: numericOr(orientation.x, 0),
+            y: numericOr(orientation.y, 0),
+            z: numericOr(orientation.z, 0),
+            w: numericOr(orientation.w, 1)
+        };
+    }
+
+    quaternionToMatrix(orientation) {
+        const q = this.cloneOrientation(orientation);
+        if (!q) return null;
+
+        const norm = Math.hypot(q.x, q.y, q.z, q.w);
+        if (norm < 1e-6) return null;
+
+        const x = q.x / norm;
+        const y = q.y / norm;
+        const z = q.z / norm;
+        const w = q.w / norm;
+
+        return [
+            [
+                1 - 2 * (y * y + z * z),
+                2 * (x * y - z * w),
+                2 * (x * z + y * w)
+            ],
+            [
+                2 * (x * y + z * w),
+                1 - 2 * (x * x + z * z),
+                2 * (y * z - x * w)
+            ],
+            [
+                2 * (x * z - y * w),
+                2 * (y * z + x * w),
+                1 - 2 * (x * x + y * y)
+            ]
+        ];
+    }
+
+    getPhoneAxes(orientation) {
+        const matrix = this.quaternionToMatrix(orientation);
+        if (!matrix) return null;
+
+        return [
+            {
+                label: 'X top',
+                color: '#ff4d4d',
+                vector: { x: matrix[0][0], y: matrix[1][0], z: matrix[2][0] }
+            },
+            {
+                label: 'Y left',
+                color: '#67e86f',
+                vector: { x: matrix[0][1], y: matrix[1][1], z: matrix[2][1] }
+            },
+            {
+                label: 'Z screen',
+                color: '#4da3ff',
+                vector: { x: matrix[0][2], y: matrix[1][2], z: matrix[2][2] }
+            }
+        ];
+    }
+
+    projectAxis(vector, centerX, centerY, scale) {
+        return {
+            x: centerX + (vector.x - 0.45 * vector.z) * scale,
+            y: centerY - (vector.y + 0.25 * vector.z) * scale
+        };
+    }
+
+    drawAxisSet(ctx, orientation, options) {
+        const axes = this.getPhoneAxes(orientation);
+        if (!axes) return;
+
+        ctx.save();
+        ctx.globalAlpha = options.alpha;
+        ctx.lineWidth = options.lineWidth;
+        ctx.setLineDash(options.dashed ? [7, 5] : []);
+
+        for (const axis of axes) {
+            const end = this.projectAxis(axis.vector, options.centerX, options.centerY, options.scale);
+
+            ctx.strokeStyle = axis.color;
+            ctx.beginPath();
+            ctx.moveTo(options.centerX, options.centerY);
+            ctx.lineTo(end.x, end.y);
+            ctx.stroke();
+
+            ctx.fillStyle = axis.color;
+            ctx.font = '12px monospace';
+            ctx.fillText(axis.label, end.x + 5, end.y - 5);
+        }
+
+        ctx.restore();
+    }
+
+    drawAxes() {
+        const canvas = this.shadowRoot.getElementById('axesCanvas');
+        if (!canvas) return;
+
+        const ctx = canvas.getContext('2d');
+        const width = canvas.width;
+        const height = canvas.height;
+        const centerX = width / 2;
+        const centerY = height / 2 + 8;
+        const scale = Math.min(width, height) * 0.36;
+
+        ctx.clearRect(0, 0, width, height);
+        ctx.fillStyle = '#050505';
+        ctx.fillRect(0, 0, width, height);
+
+        ctx.fillStyle = '#777';
+        ctx.font = '12px monospace';
+        ctx.fillText('phone raw WebXR axes', 12, 20);
+
+        if (!this.localStats.orientation) {
+            ctx.fillText('waiting for pose...', centerX - 58, centerY);
+            return;
+        }
+
+        if (this.referenceOrientation) {
+            this.drawAxisSet(ctx, this.referenceOrientation, {
+                centerX,
+                centerY,
+                scale,
+                alpha: 0.35,
+                lineWidth: 2,
+                dashed: true
+            });
+        }
+
+        this.drawAxisSet(ctx, this.localStats.orientation, {
+            centerX,
+            centerY,
+            scale,
+            alpha: 1,
+            lineWidth: 4,
+            dashed: false
+        });
+
+        ctx.fillStyle = '#fff';
+        ctx.beginPath();
+        ctx.arc(centerX, centerY, 4, 0, Math.PI * 2);
+        ctx.fill();
     }
 
     // Getters
