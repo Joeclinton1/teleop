@@ -5,15 +5,15 @@ class TeleopUI extends HTMLElement {
 
         // State
         this.sliderValue = 1.0;
-        this.gripperEngaged = false;
+        this.gripperValue = 0.0; // absolute gripper position in [0, 1]
         this.motionEnabled = false;
-        this.reservedButtonAActive = false;
-        this.reservedButtonBActive = false;
-        this.localStats = { position: { x: 0, y: 0, z: 0 }, orientation: { x: 0, y: 0, z: 0, w: 0 }, fps: 0 };
+        this.localStats = { position: { x: 0, y: 0, z: 0 }, orientation: null, fps: 0 };
+        this.referenceOrientation = null;
         this.serverDiagnostics = {};
 
         this.createComponent();
         this.setupEventListeners();
+        this.drawAxes();
     }
 
     createComponent() {
@@ -34,6 +34,7 @@ class TeleopUI extends HTMLElement {
                     color: white;
                     padding: 10px;
                     box-sizing: border-box;
+                    overflow-y: auto;
                 }
                 
                 .header {
@@ -86,11 +87,11 @@ class TeleopUI extends HTMLElement {
                 }
 
                 .info-section {
-                    flex: 1;
+                    flex: 0 0 auto;
                     display: flex;
                     flex-direction: column;
-                    gap: 15px;
-                    margin-bottom: 20px;
+                    gap: 10px;
+                    margin-bottom: 12px;
                 }
                 
                 .info-box {
@@ -113,71 +114,104 @@ class TeleopUI extends HTMLElement {
                     white-space: pre-wrap;
                     word-wrap: break-word;
                 }
-                
-                .controls {
-                    display: flex;
-                    gap: 15px;
-                    justify-content: center;
-                    align-items: center;
-                }
-                
-                .control-button {
-                    flex: 1;
-                    min-height: 60px;
-                    border: none;
-                    font-size: 14px;
-                    cursor: pointer;
-                    transition: all 0.2s;
-                    text-transform: uppercase;
-                    border-radius: 6px;
-                }
-                
-                .gripper-button {
-                    background:rgb(174, 255, 193);
-                    color: black;
-                }
-                
-                .gripper-button.engaged {
-                    background: rgb(255, 174, 174);
-                }
-                
-                .motion-button {
-                    background: #fff;
-                    color: black;
-                }
-                
-                .motion-button.active {
-                    background: rgb(255, 174, 174);
-                    transform: scale(0.95);
-                }
-                
-                .reserved-section {
-                    display: flex;
-                    justify-content: center;
-                    gap: 20px;
-                    margin-bottom: 20px;
-                }
-                
-                .reserved-button {
-                    width: 50px;
-                    height: 50px;
-                    background: #333;
-                    border: 2px solid #555;
-                    border-radius: 8px;
-                    color: #888;
-                    font-size: 16px;
-                    font-weight: bold;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
+
+                .axes-section {
+                    flex: 0 0 auto;
+                    background: #121212;
+                    border: 1px solid #333;
+                    padding: 8px;
+                    margin-bottom: 12px;
                 }
 
-                .reserved-button.active {
-                    background: #555;
-                    color: #fff;
-                    transform: scale(0.95);
+                .axes-canvas {
+                    display: block;
+                    width: 100%;
+                    max-width: 360px;
+                    height: 160px;
+                    margin: 0 auto;
+                    background: #050505;
+                    pointer-events: none;
                 }
-                
+
+                .status-chip {
+                    padding: 5px 12px;
+                    border-radius: 12px;
+                    font-size: 12px;
+                    font-weight: bold;
+                    background: #f44336;
+                    color: #fff;
+                }
+
+                .status-chip.connected {
+                    background: #4caf50;
+                }
+
+                .controls {
+                    display: flex;
+                    flex-direction: column;
+                    align-items: center;
+                    gap: 12px;
+                    margin-top: 4px;
+                }
+
+                .gripper-label {
+                    font-size: 16px;
+                    font-weight: bold;
+                    text-transform: uppercase;
+                    color: #fff;
+                    text-align: center;
+                }
+
+                .gripper-label.active {
+                    color: rgb(255, 174, 174);
+                }
+
+                .gripper-slider {
+                    position: relative;
+                    width: 90px;
+                    height: 260px;
+                    background: #333;
+                    border-radius: 45px;
+                    touch-action: none;
+                    user-select: none;
+                    overflow: hidden;
+                }
+
+                .gripper-slider.active {
+                    background: #4a3030;
+                }
+
+                .gripper-fill {
+                    position: absolute;
+                    left: 0;
+                    right: 0;
+                    bottom: 0;
+                    background: rgb(174, 255, 193);
+                    opacity: 0.25;
+                }
+
+                .gripper-slider.active .gripper-fill {
+                    background: rgb(255, 174, 174);
+                    opacity: 0.35;
+                }
+
+                .gripper-knob {
+                    position: absolute;
+                    left: 50%;
+                    width: 78px;
+                    height: 78px;
+                    background: #fff;
+                    border-radius: 50%;
+                    transform: translateX(-50%);
+                    pointer-events: none;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    color: #000;
+                    font-size: 14px;
+                    font-weight: bold;
+                }
+
                 @media (min-width: 768px) {
                     .info-section {
                         flex-direction: row;
@@ -206,43 +240,35 @@ class TeleopUI extends HTMLElement {
             
             <div class="container">
                 <div class="header">
-                    <div></div>
+                    <div class="status-chip disconnected" id="statusChip">Connecting...</div>
                     <button class="exit-button" id="exitButton">✕</button>
                 </div>
-                
+
+                <div class="axes-section">
+                    <canvas class="axes-canvas" id="axesCanvas" width="360" height="160"></canvas>
+                </div>
+
                 <div class="info-section">
                     <div class="info-box">
                         <div class="info-title">Local Stats</div>
                         <div class="info-content" id="statsContent">Waiting...</div>
                     </div>
-                    
-                    <div class="info-box">
-                        <div class="info-title">Server Status</div>
-                        <div class="info-content" id="diagnosticsContent">Waiting...</div>
-                    </div>
-                </div>
-                
-                <div class="auxilary-section">
-                <div class="scale-section">
-                    <input type="range" class="scale-slider" id="scaleSlider" 
-                        min="0" max="5" step="1" value="3">
-                    <div class="scale-value" id="scaleValue">scale 1.0</div>
                 </div>
 
-                <div class="reserved-section">
-                    <div class="reserved-button" id="reservedButtonA">A</div>
-                    <div class="reserved-button" id="reservedButtonB">B</div>
+                <div class="auxilary-section">
+                <div class="scale-section">
+                    <input type="range" class="scale-slider" id="scaleSlider"
+                        min="0" max="5" step="1" value="3">
+                    <div class="scale-value" id="scaleValue">scale 1.0</div>
                 </div>
                 </div>
 
                 <div class="controls">
-                    <button class="control-button gripper-button" id="gripperButton">
-                        gripper disengaged
-                    </button>
-                    
-                    <button class="control-button motion-button" id="motionButton">
-                        hold to move
-                    </button>
+                    <div class="gripper-label" id="gripperLabel">Hold to Move</div>
+                    <div class="gripper-slider" id="gripperSlider">
+                        <div class="gripper-fill" id="gripperFill"></div>
+                        <div class="gripper-knob" id="gripperKnob"></div>
+                    </div>
                 </div>
             </div>
         `;
@@ -251,10 +277,8 @@ class TeleopUI extends HTMLElement {
     setupEventListeners() {
         const exitButton = this.shadowRoot.getElementById('exitButton');
         const scaleSlider = this.shadowRoot.getElementById('scaleSlider');
-        const gripperButton = this.shadowRoot.getElementById('gripperButton');
-        const motionButton = this.shadowRoot.getElementById('motionButton');
-        const reservedButtonA = this.shadowRoot.getElementById('reservedButtonA');
-        const reservedButtonB = this.shadowRoot.getElementById('reservedButtonB');
+        const gripperSlider = this.shadowRoot.getElementById('gripperSlider');
+        const gripperLabel = this.shadowRoot.getElementById('gripperLabel');
 
         // Exit button
         exitButton.addEventListener('click', () => {
@@ -265,106 +289,80 @@ class TeleopUI extends HTMLElement {
         scaleSlider.addEventListener('input', (event) => {
             const sliderValues = [0.1, 0.25, 0.5, 1.0, 2.0, 4.0];
             this.sliderValue = sliderValues[event.target.value];
-            this.shadowRoot.getElementById('scaleValue').textContent = `scale scale ${this.sliderValue.toFixed(2)}`;
+            this.shadowRoot.getElementById('scaleValue').textContent = `scale ${this.sliderValue.toFixed(2)}`;
 
             this.dispatchEvent(new CustomEvent('scalechange', {
                 detail: { scale: this.sliderValue }
             }));
         });
 
-        // Gripper button
-        gripperButton.addEventListener('click', () => {
-            this.gripperEngaged = !this.gripperEngaged;
-            gripperButton.textContent = `Gripper ${this.gripperEngaged ? 'Engaged' : 'Disengaged'}`;
-            if (this.gripperEngaged) {
-                gripperButton.classList.add('engaged');
-            } else {
-                gripperButton.classList.remove('engaged');
-            }
+        // Gripper slider doubles as the hold-to-move control: pressing it enables motion and sets
+        // the absolute gripper position from the touch's vertical position (top = 1, bottom = 0).
+        // The track is fixed; tapping anywhere jumps the gripper to that position.
+        const valueFromEvent = (event) => {
+            const point = event.touches && event.touches[0] ? event.touches[0] : event;
+            const rect = gripperSlider.getBoundingClientRect();
+            const ratio = (rect.bottom - point.clientY) / rect.height;
+            return Math.max(0, Math.min(1, ratio));
+        };
 
-            this.dispatchEvent(new CustomEvent('gripperchange', {
-                detail: { engaged: this.gripperEngaged }
-            }));
-        });
+        const updateGripperVisual = () => {
+            const knob = this.shadowRoot.getElementById('gripperKnob');
+            const fill = this.shadowRoot.getElementById('gripperFill');
+            // Inset the knob travel by its own height so it stays fully inside the track.
+            knob.style.bottom = `calc(${this.gripperValue} * (100% - 78px))`;
+            knob.textContent = `${Math.round(this.gripperValue * 100)}`;
+            fill.style.height = `${this.gripperValue * 100}%`;
+        };
 
-        // Motion button (touch and mouse events)
-        const handleMotionStart = (event) => {
+        const handleGripperStart = (event) => {
             event.preventDefault();
             this.motionEnabled = true;
-            motionButton.classList.add('active');
-            motionButton.textContent = 'Moving...';
+            gripperSlider.classList.add('active');
+            gripperLabel.classList.add('active');
+            gripperLabel.textContent = 'Moving...';
+            this.referenceOrientation = this.cloneOrientation(this.localStats.orientation);
+            this.gripperValue = valueFromEvent(event);
+            updateGripperVisual();
+            this.drawAxes();
 
-            this.dispatchEvent(new CustomEvent('motionchange', {
-                detail: { enabled: true }
-            }));
+            this.dispatchEvent(new CustomEvent('motionchange', { detail: { enabled: true } }));
         };
 
-        const handleMotionEnd = () => {
+        const handleGripperMove = (event) => {
             if (!this.motionEnabled) return;
-
-            this.motionEnabled = false;
-            motionButton.classList.remove('active');
-            motionButton.textContent = 'Hold to Move';
-
-            this.dispatchEvent(new CustomEvent('motionchange', {
-                detail: { enabled: false }
-            }));
+            event.preventDefault();
+            this.gripperValue = valueFromEvent(event);
+            updateGripperVisual();
         };
 
-        const handleReservedButtonStart = (event, buttonName) => {
-            event.preventDefault();
-            const buttonId = event.currentTarget.id;
-            const button = this.shadowRoot.getElementById(buttonId);
-            button.classList.add('active');
+        const handleGripperEnd = () => {
+            if (!this.motionEnabled) return;
+            this.motionEnabled = false;
+            gripperSlider.classList.remove('active');
+            gripperLabel.classList.remove('active');
+            gripperLabel.textContent = 'Hold to Move';
 
-            const buttonNameLower = buttonName.toLowerCase();
+            this.dispatchEvent(new CustomEvent('motionchange', { detail: { enabled: false } }));
+        };
 
-            if (buttonName === 'A')
-                this.reservedButtonAActive = true;
-            else if (buttonName === 'B')
-                this.reservedButtonBActive = true;
-            this.dispatchEvent(new CustomEvent(`reservedbutton${buttonNameLower}change`, {
-                detail: { active: true }
-            }));
-        }
+        gripperSlider.addEventListener('mousedown', handleGripperStart);
+        gripperSlider.addEventListener('touchstart', handleGripperStart, { passive: false });
+        document.addEventListener('mousemove', handleGripperMove);
+        document.addEventListener('touchmove', handleGripperMove, { passive: false });
+        document.addEventListener('mouseup', handleGripperEnd);
+        document.addEventListener('touchend', handleGripperEnd);
 
-        const handleReservedButtonEnd = (buttonName) => {
-            if (!this.reservedButtonAActive && buttonName === 'A') return;
-            if (!this.reservedButtonBActive && buttonName === 'B') return;
-
-            const button = (buttonName === 'A') ? reservedButtonA : reservedButtonB;
-            button.classList.remove('active');
-
-            const buttonNameLower = buttonName.toLowerCase();
-
-            if (buttonName === 'A')
-                this.reservedButtonAActive = false;
-            else if (buttonName === 'B')
-                this.reservedButtonBActive = false;
-            this.dispatchEvent(new CustomEvent(`reservedbutton${buttonNameLower}change`, {
-                detail: { active: false }
-            }));
-        }
-
-        motionButton.addEventListener('mousedown', handleMotionStart);
-        motionButton.addEventListener('touchstart', handleMotionStart);
-        document.addEventListener('mouseup', handleMotionEnd);
-        document.addEventListener('touchend', handleMotionEnd);
-
-        reservedButtonA.addEventListener('mousedown', e => handleReservedButtonStart(e, 'A'));
-        reservedButtonA.addEventListener('touchstart', e => handleReservedButtonStart(e, 'A'));
-        document.addEventListener('mouseup', () => handleReservedButtonEnd('A'));
-        document.addEventListener('touchend', () => handleReservedButtonEnd('A'));
-
-        reservedButtonB.addEventListener('mousedown', e => handleReservedButtonStart(e, 'B'));
-        reservedButtonB.addEventListener('touchstart', e => handleReservedButtonStart(e, 'B'));
-        document.addEventListener('mouseup', () => handleReservedButtonEnd('B'));
-        document.addEventListener('touchend', () => handleReservedButtonEnd('B'));
+        updateGripperVisual();
     }
 
     // Public methods to update displays
     updateLocalStats(stats) {
         this.localStats = stats;
+        if (!this.referenceOrientation && stats.orientation) {
+            this.referenceOrientation = this.cloneOrientation(stats.orientation);
+        }
+
         const statsContent = this.shadowRoot.getElementById('statsContent');
 
         statsContent.textContent = '';
@@ -385,17 +383,171 @@ class TeleopUI extends HTMLElement {
             statsContent.textContent += `FPS: ${fps}
 `;
         }
+
+        this.drawAxes();
     }
 
     updateServerDiagnostics(data) {
         this.serverDiagnostics = data;
-        const diagnosticsContent = this.shadowRoot.getElementById('diagnosticsContent');
+        const statusChip = this.shadowRoot.getElementById('statusChip');
+        if (!statusChip) return;
 
-        if (typeof data === 'object') {
-            diagnosticsContent.textContent = JSON.stringify(data, null, 2);
-        } else {
-            diagnosticsContent.textContent = data;
+        const connection = (typeof data === 'object' && data) ? data.connection : data;
+        const isConnected = String(connection).toLowerCase() === 'connected';
+        statusChip.textContent = isConnected ? 'Connected' : (connection || 'Disconnected');
+        statusChip.className = `status-chip ${isConnected ? 'connected' : 'disconnected'}`;
+    }
+
+    cloneOrientation(orientation) {
+        if (!orientation) return null;
+        const numericOr = (value, fallback) => {
+            const numeric = Number(value);
+            return Number.isFinite(numeric) ? numeric : fallback;
+        };
+
+        return {
+            x: numericOr(orientation.x, 0),
+            y: numericOr(orientation.y, 0),
+            z: numericOr(orientation.z, 0),
+            w: numericOr(orientation.w, 1)
+        };
+    }
+
+    quaternionToMatrix(orientation) {
+        const q = this.cloneOrientation(orientation);
+        if (!q) return null;
+
+        const norm = Math.hypot(q.x, q.y, q.z, q.w);
+        if (norm < 1e-6) return null;
+
+        const x = q.x / norm;
+        const y = q.y / norm;
+        const z = q.z / norm;
+        const w = q.w / norm;
+
+        return [
+            [
+                1 - 2 * (y * y + z * z),
+                2 * (x * y - z * w),
+                2 * (x * z + y * w)
+            ],
+            [
+                2 * (x * y + z * w),
+                1 - 2 * (x * x + z * z),
+                2 * (y * z - x * w)
+            ],
+            [
+                2 * (x * z - y * w),
+                2 * (y * z + x * w),
+                1 - 2 * (x * x + y * y)
+            ]
+        ];
+    }
+
+    getPhoneAxes(orientation) {
+        const matrix = this.quaternionToMatrix(orientation);
+        if (!matrix) return null;
+
+        return [
+            {
+                label: 'X top',
+                color: '#ff4d4d',
+                vector: { x: matrix[0][0], y: matrix[1][0], z: matrix[2][0] }
+            },
+            {
+                label: 'Y left',
+                color: '#67e86f',
+                vector: { x: matrix[0][1], y: matrix[1][1], z: matrix[2][1] }
+            },
+            {
+                label: 'Z screen',
+                color: '#4da3ff',
+                vector: { x: matrix[0][2], y: matrix[1][2], z: matrix[2][2] }
+            }
+        ];
+    }
+
+    projectAxis(vector, centerX, centerY, scale) {
+        return {
+            x: centerX + (vector.x - 0.45 * vector.z) * scale,
+            y: centerY - (vector.y + 0.25 * vector.z) * scale
+        };
+    }
+
+    drawAxisSet(ctx, orientation, options) {
+        const axes = this.getPhoneAxes(orientation);
+        if (!axes) return;
+
+        ctx.save();
+        ctx.globalAlpha = options.alpha;
+        ctx.lineWidth = options.lineWidth;
+        ctx.setLineDash(options.dashed ? [7, 5] : []);
+
+        for (const axis of axes) {
+            const end = this.projectAxis(axis.vector, options.centerX, options.centerY, options.scale);
+
+            ctx.strokeStyle = axis.color;
+            ctx.beginPath();
+            ctx.moveTo(options.centerX, options.centerY);
+            ctx.lineTo(end.x, end.y);
+            ctx.stroke();
+
+            ctx.fillStyle = axis.color;
+            ctx.font = '12px monospace';
+            ctx.fillText(axis.label, end.x + 5, end.y - 5);
         }
+
+        ctx.restore();
+    }
+
+    drawAxes() {
+        const canvas = this.shadowRoot.getElementById('axesCanvas');
+        if (!canvas) return;
+
+        const ctx = canvas.getContext('2d');
+        const width = canvas.width;
+        const height = canvas.height;
+        const centerX = width / 2;
+        const centerY = height / 2 + 8;
+        const scale = Math.min(width, height) * 0.36;
+
+        ctx.clearRect(0, 0, width, height);
+        ctx.fillStyle = '#050505';
+        ctx.fillRect(0, 0, width, height);
+
+        ctx.fillStyle = '#777';
+        ctx.font = '12px monospace';
+        ctx.fillText('phone raw WebXR axes', 12, 20);
+
+        if (!this.localStats.orientation) {
+            ctx.fillText('waiting for pose...', centerX - 58, centerY);
+            return;
+        }
+
+        if (this.referenceOrientation) {
+            this.drawAxisSet(ctx, this.referenceOrientation, {
+                centerX,
+                centerY,
+                scale,
+                alpha: 0.35,
+                lineWidth: 2,
+                dashed: true
+            });
+        }
+
+        this.drawAxisSet(ctx, this.localStats.orientation, {
+            centerX,
+            centerY,
+            scale,
+            alpha: 1,
+            lineWidth: 4,
+            dashed: false
+        });
+
+        ctx.fillStyle = '#fff';
+        ctx.beginPath();
+        ctx.arc(centerX, centerY, 4, 0, Math.PI * 2);
+        ctx.fill();
     }
 
     // Getters
@@ -403,20 +555,22 @@ class TeleopUI extends HTMLElement {
         return this.sliderValue;
     }
 
-    isGripperEngaged() {
-        return this.gripperEngaged;
+    getGripper() {
+        return this.gripperValue;
     }
 
     isMotionEnabled() {
         return this.motionEnabled;
     }
 
+    // Reserved A/B buttons were removed from the phone UI; kept as stubs so the shared
+    // pose-message builder works unchanged.
     isReservedButtonAActive() {
-        return this.reservedButtonAActive;
+        return false;
     }
 
     isReservedButtonBActive() {
-        return this.reservedButtonBActive;
+        return false;
     }
 }
 

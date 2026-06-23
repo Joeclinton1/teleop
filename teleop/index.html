@@ -5,7 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Teleop</title>
-    <script src="/assets/teleop-ui.js"></script>
+    <script src="/assets/teleop-ui.js?v=gripper-slider-1"></script>
 
     <style>
         * {
@@ -56,6 +56,23 @@
             text-transform: uppercase;
         }
 
+        .button.secondary {
+            background-color: #222;
+            color: #ddd;
+            font-size: 14px;
+            margin-top: 12px;
+        }
+
+        .wrist-status {
+            margin-top: 14px;
+            font-size: 12px;
+            color: #888;
+        }
+
+        .wrist-status.ok {
+            color: #4caf50;
+        }
+
         .app {
             margin: 0;
             padding: 0;
@@ -94,6 +111,9 @@
             <h1>Teleop</h1>
             <p>Teleop your robot arm with ease. No hardware. No firmware. Just your phone. Or VR headset.</p>
             <button class="button" id="start-button">Start</button>
+            <br>
+            <button class="button secondary" id="calibrate-button">Calibrate Wrist (VR)</button>
+            <div class="wrist-status" id="wrist-status"></div>
             <div class="message" id="log"></div>
         </div>
     </div>
@@ -103,9 +123,147 @@
     </div>
 
     <script>
+        // ===================================================================
+        // Wrist-pivot calibration (ported from Dream-Machines vr-teleop-kit).
+        //
+        // WebXR gripSpace's origin sits at the palm, but the operator's real
+        // wrist pivot is a few cm behind it. Streaming the palm point means a
+        // pure wrist twist swings the reported position around, which the arm
+        // IK then chases as ghost translation. We shift the streamed readout
+        // point back to the wrist pivot so wrist twists produce ~zero
+        // translation. The per-hand offset (controller-local frame) is found
+        // by a short in-VR calibration: hold the wrist still, twist freely,
+        // and solve for the local point that stays fixed.
+        // ===================================================================
+        const WRIST_OFFSET_KEY = 'teleop:wrist_offset_v1';
+        const WRIST_DEFAULT_Z = 0.05; // 5cm back along the grip, until calibrated
+        let readoutOffset = [0, 0, WRIST_DEFAULT_Z];
+
+        const wristStatusDom = document.querySelector('#wrist-status');
+        const setWristStatus = (ok, text) => {
+            wristStatusDom.textContent = text;
+            wristStatusDom.className = 'wrist-status' + (ok ? ' ok' : '');
+        };
+        try {
+            const stored = JSON.parse(localStorage.getItem(WRIST_OFFSET_KEY) || 'null');
+            if (stored && Array.isArray(stored.right)) {
+                readoutOffset = stored.right;
+                setWristStatus(true, `wrist calibrated (${readoutOffset.map(v => v.toFixed(2)).join(', ')})`);
+            } else {
+                setWristStatus(false, `wrist not calibrated — using default ${(WRIST_DEFAULT_Z * 100).toFixed(0)}cm offset`);
+            }
+        } catch (e) {
+            setWristStatus(false, 'wrist not calibrated');
+        }
+
+        // Quaternion (xyzw) → 3x3 rotation matrix (row-major nested arrays).
+        const quatToMat3 = (q) => {
+            const [x, y, z, w] = q;
+            const xx = x * x, yy = y * y, zz = z * z;
+            const xy = x * y, xz = x * z, yz = y * z;
+            const wx = w * x, wy = w * y, wz = w * z;
+            return [
+                [1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)],
+                [2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)],
+                [2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)],
+            ];
+        };
+
+        // Rotate vector v by quaternion q (xyzw).
+        const rotateVecByQuat = (v, q) => {
+            const [qx, qy, qz, qw] = q;
+            const [vx, vy, vz] = v;
+            const c1x = qy * vz - qz * vy;
+            const c1y = qz * vx - qx * vz;
+            const c1z = qx * vy - qy * vx;
+            const c2x = qy * c1z - qz * c1y;
+            const c2y = qz * c1x - qx * c1z;
+            const c2z = qx * c1y - qy * c1x;
+            return [
+                vx + 2 * qw * c1x + 2 * c2x,
+                vy + 2 * qw * c1y + 2 * c2y,
+                vz + 2 * qw * c1z + 2 * c2z,
+            ];
+        };
+
+        // Solve M·x = v (3x3) via Cramer's rule. Returns null if ill-conditioned.
+        const solve3x3 = (M, v) => {
+            const [m00, m01, m02] = M[0];
+            const [m10, m11, m12] = M[1];
+            const [m20, m21, m22] = M[2];
+            const det = m00 * (m11 * m22 - m12 * m21)
+                - m01 * (m10 * m22 - m12 * m20)
+                + m02 * (m10 * m21 - m11 * m20);
+            const tr = Math.abs(m00) + Math.abs(m11) + Math.abs(m22);
+            if (!Number.isFinite(det) || Math.abs(det) < 1e-6 * Math.max(1, tr) ** 3) return null;
+            const dx = v[0] * (m11 * m22 - m12 * m21) - m01 * (v[1] * m22 - m12 * v[2]) + m02 * (v[1] * m21 - m11 * v[2]);
+            const dy = m00 * (v[1] * m22 - m12 * v[2]) - v[0] * (m10 * m22 - m12 * m20) + m02 * (m10 * v[2] - v[1] * m20);
+            const dz = m00 * (m11 * v[2] - v[1] * m21) - m01 * (m10 * v[2] - v[1] * m20) + v[0] * (m10 * m21 - m11 * m20);
+            return [dx / det, dy / det, dz / det];
+        };
+
+        // Given samples {p, R} taken while the wrist pivot was held still,
+        // find the controller-local offset o so that p + R·o is constant:
+        //   o = -(Σ dRᵀ dR)⁻¹ (Σ dRᵀ dp), mean-centered. Returns {ok, o, rms}.
+        const solvePivot = (samples) => {
+            const N = samples.length;
+            if (N < 30) return { ok: false, reason: `too few samples (${N})` };
+            const pbar = [0, 0, 0];
+            const Rbar = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+            for (const s of samples) {
+                for (let i = 0; i < 3; i++) {
+                    pbar[i] += s.p[i];
+                    for (let j = 0; j < 3; j++) Rbar[i][j] += s.R[i][j];
+                }
+            }
+            for (let i = 0; i < 3; i++) {
+                pbar[i] /= N;
+                for (let j = 0; j < 3; j++) Rbar[i][j] /= N;
+            }
+            const A = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+            const b = [0, 0, 0];
+            for (const s of samples) {
+                const dR = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+                for (let i = 0; i < 3; i++)
+                    for (let j = 0; j < 3; j++)
+                        dR[i][j] = s.R[i][j] - Rbar[i][j];
+                const dp = [s.p[0] - pbar[0], s.p[1] - pbar[1], s.p[2] - pbar[2]];
+                for (let i = 0; i < 3; i++) {
+                    for (let j = 0; j < 3; j++) {
+                        let aij = 0;
+                        for (let k = 0; k < 3; k++) aij += dR[k][i] * dR[k][j];
+                        A[i][j] += aij;
+                    }
+                    let bi = 0;
+                    for (let k = 0; k < 3; k++) bi += dR[k][i] * dp[k];
+                    b[i] += bi;
+                }
+            }
+            const o = solve3x3(A, [-b[0], -b[1], -b[2]]);
+            if (!o) return { ok: false, reason: 'ill-conditioned' };
+            // RMS residual of the recovered pivot path — small means held still.
+            const cm = [0, 0, 0];
+            const pivots = samples.map(s => [
+                s.p[0] + s.R[0][0] * o[0] + s.R[0][1] * o[1] + s.R[0][2] * o[2],
+                s.p[1] + s.R[1][0] * o[0] + s.R[1][1] * o[1] + s.R[1][2] * o[2],
+                s.p[2] + s.R[2][0] * o[0] + s.R[2][1] * o[1] + s.R[2][2] * o[2],
+            ]);
+            for (const pv of pivots) for (let i = 0; i < 3; i++) cm[i] += pv[i] / N;
+            let sumSq = 0;
+            for (const pv of pivots) {
+                const dx = pv[0] - cm[0], dy = pv[1] - cm[1], dz = pv[2] - cm[2];
+                sumSq += dx * dx + dy * dy + dz * dz;
+            }
+            return { ok: true, o, rms: Math.sqrt(sumSq / N), n: N };
+        };
+
+        // ===================================================================
+        // VR controller input — grip = clutch (motion enable), analog
+        // trigger = absolute gripper position [0,1], thumbstick X = scale.
+        // ===================================================================
         class TeleopJoystick {
             constructor() {
-                this.gripper = 'open';
+                this.gripperValue = 0.0;    // analog trigger, 0=open .. 1=closed
                 this.moveButtonPressed = false;
                 this.reservedButtonA = false;
                 this.reservedButtonB = false;
@@ -113,56 +271,35 @@
             }
 
             handleControllerInput(session, frame) {
-                const inputSources = session.inputSources;
-                for (let inputSource of inputSources) {
+                for (let inputSource of session.inputSources) {
                     if (inputSource.gamepad && inputSource.handedness === 'right') {
                         const gamepad = inputSource.gamepad;
-                        if (gamepad.buttons[1] && gamepad.buttons[1].pressed) {
-                            this.moveButtonPressed = true;
-                        } else {
-                            this.moveButtonPressed = false;
-                        }
-
-                        if (gamepad.buttons[0] && gamepad.buttons[0].pressed && !gamepad.buttons[0].wasPressed) {
-                            this.gripper = (this.gripper === 'open') ? 'close' : 'open';
-                        }
-                        gamepad.buttons[0].wasPressed = gamepad.buttons[0].pressed;
-
-                        this.reservedButtonA = gamepad.buttons[4] && gamepad.buttons[4].pressed;
-                        this.reservedButtonB = gamepad.buttons[5] && gamepad.buttons[5].pressed;
-
-                        const gamepadAxis = gamepad.axes[0];
-                        if (gamepadAxis !== undefined && Math.abs(gamepadAxis) > 0.1) {
-                            this.scale = Math.max(0.2, Math.min(1.0, this.scale + gamepadAxis * 0.1));
+                        // buttons[1] = grip/squeeze → clutch (hold to move).
+                        this.moveButtonPressed = !!(gamepad.buttons[1] && gamepad.buttons[1].pressed);
+                        // buttons[0] = trigger → analog absolute gripper.
+                        this.gripperValue = gamepad.buttons[0] ? gamepad.buttons[0].value : 0.0;
+                        this.reservedButtonA = !!(gamepad.buttons[4] && gamepad.buttons[4].pressed);
+                        this.reservedButtonB = !!(gamepad.buttons[5] && gamepad.buttons[5].pressed);
+                        // Thumbstick X (axes[2] on Quest, fall back to axes[0]) trims scale.
+                        const axis = gamepad.axes.length > 2 ? gamepad.axes[2] : gamepad.axes[0];
+                        if (axis !== undefined && Math.abs(axis) > 0.1) {
+                            this.scale = Math.max(0.2, Math.min(1.0, this.scale + axis * 0.02));
                         }
                     }
                 }
             }
 
-            isMotionEnabled() {
-                return this.moveButtonPressed;
-            }
-
-            isGripperEngaged() {
-                return this.gripper === 'close';
-            }
-
-            isReservedButtonAActive() {
-                return this.reservedButtonA;
-            }
-
-            isReservedButtonBActive() {
-                return this.reservedButtonB;
-            }
-
-            getScale() {
-                return this.scale;
-            }
+            isMotionEnabled() { return this.moveButtonPressed; }
+            isReservedButtonAActive() { return this.reservedButtonA; }
+            isReservedButtonBActive() { return this.reservedButtonB; }
+            getScale() { return this.scale; }
+            getGripper() { return this.gripperValue; }
         }
 
         const teleopUI = document.querySelector('#teleop-ui');
         const teleopJoystick = new TeleopJoystick();
         const startButtonDom = document.querySelector('#start-button');
+        const calibrateButtonDom = document.querySelector('#calibrate-button');
         const appDom = document.querySelector('#app');
 
         // FPS Counter
@@ -173,7 +310,7 @@
         function updateFPS() {
             frameCount++;
             const currentTime = performance.now();
-            if (currentTime - lastFpsTime >= 1000) { // Update every second
+            if (currentTime - lastFpsTime >= 1000) {
                 fps = Math.round((frameCount * 1000) / (currentTime - lastFpsTime));
                 frameCount = 0;
                 lastFpsTime = currentTime;
@@ -181,9 +318,7 @@
         }
 
         // WebSocket connection
-        const serverStats = {
-            connection: 'Not connected',
-        };
+        const serverStats = { connection: 'Not connected' };
         teleopUI.updateServerDiagnostics(serverStats);
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsUrl = `${protocol}//${window.location.host}/ws`;
@@ -192,11 +327,23 @@
 
         const connectionStatus = document.querySelector('#connection-status');
 
+        // Pulse the active controllers (used as a haptic cue from the robot
+        // and as start/end signals during calibration).
+        let activeSession = null;
+        function pulseControllers(intensity, durationMs) {
+            if (!activeSession) return;
+            for (const src of activeSession.inputSources) {
+                const ha = src.gamepad && src.gamepad.hapticActuators;
+                if (ha && ha[0]) {
+                    try { ha[0].pulse(Math.max(0, Math.min(1, intensity)), durationMs); } catch (_) {}
+                }
+            }
+        }
+
         function connectWebSocket() {
             socket = new WebSocket(wsUrl);
 
             socket.onopen = () => {
-                console.log('Connected to server');
                 isConnected = true;
                 connectionStatus.textContent = 'Connected';
                 connectionStatus.className = 'connection-status connected';
@@ -205,55 +352,48 @@
             };
 
             socket.onclose = () => {
-                console.log('Disconnected from server');
                 isConnected = false;
                 connectionStatus.textContent = 'Disconnected';
                 connectionStatus.className = 'connection-status disconnected';
                 serverStats.connection = 'Disconnected';
                 teleopUI.updateServerDiagnostics(serverStats);
-
-                // Attempt to reconnect after 3 seconds
                 setTimeout(connectWebSocket, 3000);
             };
 
-            socket.onerror = (error) => {
-                console.error('WebSocket error:', error);
-                serverStats.connection = 'Error: ' + error.message;
+            socket.onerror = () => {
+                serverStats.connection = 'Error';
                 teleopUI.updateServerDiagnostics(serverStats);
             };
 
             socket.onmessage = (event) => {
-                const message = JSON.parse(event.data);
-                console.log('Received message:', message);
+                let msg;
+                try { msg = JSON.parse(event.data); } catch (_) { return; }
+                // Robot → controller haptic cue (e.g. joint-rate limiter is
+                // clamping = "you're pushing past what's safe"). Buzz the
+                // controller proportionally to the reported intensity.
+                if (msg && msg.type === 'haptic') {
+                    const intensity = Number(msg.intensity) || 0;
+                    if (intensity > 0.02) pulseControllers(intensity, 40);
+                }
             };
         }
 
-        // Connect on page load
         connectWebSocket();
 
         // Message handling
         let message = '';
-        const setMessage = (msg) => {
-            console.log(msg);
-            message = msg;
-        }
+        const setMessage = (msg) => { message = msg; };
 
         const sendPose = (pose) => {
             if (isConnected && socket.readyState === WebSocket.OPEN) {
-                socket.send(JSON.stringify({
-                    type: 'pose',
-                    data: pose
-                }));
-            } else {
-                console.error('WebSocket not connected, cannot send pose');
+                socket.send(JSON.stringify({ type: 'pose', data: pose }));
             }
-        }
+        };
 
         let isVRDevice = false;
 
         function detectDeviceType(session) {
-            const inputSources = session.inputSources;
-            for (let inputSource of inputSources) {
+            for (let inputSource of session.inputSources) {
                 if (inputSource.handedness === 'right' && inputSource.targetRayMode === 'tracked-pointer') {
                     return true;
                 }
@@ -261,89 +401,177 @@
             return false;
         }
 
-        function getPoseFromInputSource(session, frame, referenceSpace) {
-            const inputSources = session.inputSources;
-            for (let inputSource of inputSources) {
-                if (inputSource.handedness === 'right' && inputSource.targetRayMode === 'tracked-pointer') {
-                    const pose = frame.getPose(inputSource.targetRaySpace, referenceSpace);
-                    if (pose) {
-                        return {
-                            position: pose.transform.position,
-                            orientation: pose.transform.orientation
-                        };
-                    }
+        // Right-controller pose from gripSpace (palm), falling back to
+        // targetRaySpace. Returns raw position + orientation; the wrist-pivot
+        // offset is applied by the caller.
+        function getRightControllerPose(session, frame, referenceSpace) {
+            for (let inputSource of session.inputSources) {
+                if (inputSource.handedness !== 'right' || inputSource.targetRayMode !== 'tracked-pointer') continue;
+                const space = inputSource.gripSpace || inputSource.targetRaySpace;
+                const pose = frame.getPose(space, referenceSpace);
+                if (pose) {
+                    return { position: pose.transform.position, orientation: pose.transform.orientation };
                 }
             }
             return null;
         }
 
+        // ---- Calibration capture state ----
+        const CALIB_GRIP_THRESHOLD = 0.7;
+        const CALIB_DURATION_S = 5.0;
+        const CALIB_RESIDUAL_MAX = 0.015; // 15mm RMS — larger means the arm moved
+        const CALIB_OFFSET_MAX = 0.20;
+        let calibMode = false;
+        let calibrating = false;
+        let calibStartTime = 0;
+        let calibSamples = [];
+        let calibApplied = false;
+
+        // Validate + apply a pivot solve. Sets the page status with concrete
+        // numbers (offset in cm, fit residual in mm, sample count) and returns
+        // true on success so the caller can give an in-VR haptic verdict.
+        function applyCalibrationResult(r) {
+            const n = calibSamples.length;
+            if (!r.ok) {
+                setWristStatus(false, `calibration failed: ${r.reason} (${n} samples) — twist more, hold the pivot still`);
+                console.log('[wrist-calib] failed', r);
+                return false;
+            }
+            const cm = r.o.map(v => (v * 100).toFixed(1));
+            const mm = (r.rms * 1000).toFixed(1);
+            console.log(`[wrist-calib] offset=(${cm.join(', ')})cm  residual=${mm}mm  samples=${r.n}`);
+            if (r.rms > CALIB_RESIDUAL_MAX) {
+                setWristStatus(false, `too noisy: fit ${mm}mm (max ${(CALIB_RESIDUAL_MAX * 1000).toFixed(0)}mm), ${r.n} samples — keep the wrist anchored, rotate only`);
+                return false;
+            }
+            if (Math.abs(r.o[0]) > CALIB_OFFSET_MAX || Math.abs(r.o[1]) > CALIB_OFFSET_MAX || Math.abs(r.o[2]) > CALIB_OFFSET_MAX) {
+                setWristStatus(false, `offset (${cm.join(', ')})cm too large — retry with more rotation variety`);
+                return false;
+            }
+            readoutOffset = r.o;
+            try {
+                localStorage.setItem(WRIST_OFFSET_KEY, JSON.stringify({ right: readoutOffset }));
+            } catch (_) {}
+            setWristStatus(true, `calibrated ✓  offset (${cm.join(', ')})cm · fit ${mm}mm · ${r.n} samples`);
+            return true;
+        }
+
         setMessage('Click the button to start WebXR');
         let lastSendTime = performance.now();
-        startButtonDom.addEventListener('click', () => {
-            if (navigator.xr) {
-                navigator.xr.requestSession('immersive-ar', {
-                    requiredFeatures: ['local-floor'],
-                    optionalFeatures: ['hand-tracking', 'unbounded', 'dom-overlay', 'dom-overlay-for-handheld-ar', 'hit-test', 'high-fixed-foveation-level'],
-                    domOverlay: { root: document.querySelector('#app') }
-                }).then((session) => {
-                    teleopUI.addEventListener('exit', () => {
-                        session.end()
-                    });
 
-                    session.addEventListener('end', () => {
-                        appDom.style.display = 'none';
-                        setMessage('Click the button to start WebXR');
-                    });
+        // Shared session launcher for both the teleop session and the
+        // dedicated calibration session (calibrate=true suppresses streaming
+        // and runs the in-VR capture ritual instead).
+        function enterXR(calibrate) {
+            if (!navigator.xr) {
+                setMessage('WebXR is not supported on this device');
+                setWristStatus(false, 'WebXR not supported on this device');
+                return;
+            }
+            calibMode = !!calibrate;
+            calibrating = false;
+            calibApplied = false;
+            calibSamples = [];
 
-                    session.addEventListener('inputsourceschange', () => {
-                        isVRDevice = detectDeviceType(session);
-                        setMessage(isVRDevice ? 'VR controllers detected' : 'Using device pose');
-                    });
+            navigator.xr.requestSession('immersive-ar', {
+                requiredFeatures: ['local-floor'],
+                optionalFeatures: ['hand-tracking', 'unbounded', 'dom-overlay', 'dom-overlay-for-handheld-ar', 'hit-test', 'high-fixed-foveation-level'],
+                domOverlay: { root: document.querySelector('#app') }
+            }).then((session) => {
+                activeSession = session;
+                teleopUI.addEventListener('exit', () => { session.end(); });
 
-                    appDom.style.display = 'block';
+                session.addEventListener('end', () => {
+                    appDom.style.display = 'none';
+                    activeSession = null;
+                    if (calibMode) {
+                        calibMode = false;
+                        if (!calibApplied) setWristStatus(false, 'calibration cancelled — squeeze the grip and twist for 5s');
+                    }
+                    setMessage('Click the button to start WebXR');
+                });
 
-                    const glCanvas = document.createElement('canvas');
-                    const gl = glCanvas.getContext('webgl', {
-                        xrCompatible: true,
-                        antialias: false,
-                        alpha: false,
-                        depth: false,
-                        stencil: false,
-                        preserveDrawingBuffer: false,
-                        powerPreference: "high-performance"
-                    });
-                    session.updateRenderState({
-                        baseLayer: new XRWebGLLayer(session, gl, {
-                            antialias: false,
-                            depth: false,
-                            stencil: false,
-                            alpha: false,
-                            multiview: false
-                        })
-                    });
+                session.addEventListener('inputsourceschange', () => {
+                    isVRDevice = detectDeviceType(session);
+                    setMessage(isVRDevice ? 'VR controllers detected' : 'Using device pose');
+                });
 
-                    session.requestReferenceSpace('local-floor').then((referenceSpace) => {
-                        let xrReferenceSpace = referenceSpace;
+                appDom.style.display = 'block';
 
-                        function onXRFrame(time, frame) {
-                            // Update FPS counter
-                            updateFPS();
+                const glCanvas = document.createElement('canvas');
+                const gl = glCanvas.getContext('webgl', {
+                    xrCompatible: true, antialias: false, alpha: false, depth: false,
+                    stencil: false, preserveDrawingBuffer: false, powerPreference: "high-performance"
+                });
+                session.updateRenderState({
+                    baseLayer: new XRWebGLLayer(session, gl, {
+                        antialias: false, depth: false, stencil: false, alpha: false, multiview: false
+                    })
+                });
 
-                            let position, orientation;
+                session.requestReferenceSpace('local-floor').then((referenceSpace) => {
+                    const xrReferenceSpace = referenceSpace;
 
-                            if (isVRDevice) {
-                                teleopJoystick.handleControllerInput(session, frame);
-                                const controllerPose = getPoseFromInputSource(session, frame, xrReferenceSpace);
-                                if (controllerPose) {
-                                    position = controllerPose.position;
-                                    orientation = controllerPose.orientation;
-                                } else {
-                                    const viewerPose = frame.getViewerPose(xrReferenceSpace);
-                                    if (viewerPose && viewerPose.views[0]) {
-                                        position = viewerPose.views[0].transform.position;
-                                        orientation = viewerPose.views[0].transform.orientation;
+                    function onXRFrame(time, frame) {
+                        updateFPS();
+                        session.requestAnimationFrame(onXRFrame);
+
+                        // ---- Calibration session: capture raw poses, no streaming ----
+                        if (calibMode) {
+                            let rightRaw = null;
+                            let gripVal = 0;
+                            for (const src of session.inputSources) {
+                                if (src.handedness !== 'right') continue;
+                                const space = src.gripSpace || src.targetRaySpace;
+                                const pose = frame.getPose(space, xrReferenceSpace);
+                                if (pose) rightRaw = pose.transform;
+                                const gp = src.gamepad;
+                                gripVal = (gp && gp.buttons[1]) ? gp.buttons[1].value : 0;
+                            }
+                            if (!calibrating && gripVal >= CALIB_GRIP_THRESHOLD) {
+                                calibrating = true;
+                                calibSamples = [];
+                                calibStartTime = time;
+                                pulseControllers(1.0, 200);
+                                setMessage('Calibrating — keep your wrist still and twist freely.');
+                            }
+                            if (calibrating && rightRaw) {
+                                const o = rightRaw.orientation;
+                                calibSamples.push({
+                                    p: [rightRaw.position.x, rightRaw.position.y, rightRaw.position.z],
+                                    R: quatToMat3([o.x, o.y, o.z, o.w]),
+                                });
+                                if ((time - calibStartTime) / 1000 >= CALIB_DURATION_S) {
+                                    // Solve in-session so we can buzz the verdict (you can't
+                                    // see the page in the headset): two short pulses = good,
+                                    // one long buzz = rejected. Then end the session.
+                                    calibrating = false;
+                                    const ok = applyCalibrationResult(solvePivot(calibSamples));
+                                    calibApplied = true;
+                                    if (ok) {
+                                        pulseControllers(1.0, 120);
+                                        setTimeout(() => pulseControllers(1.0, 120), 200);
+                                    } else {
+                                        pulseControllers(1.0, 500);
                                     }
+                                    setTimeout(() => { if (activeSession) activeSession.end(); }, 600);
                                 }
+                            }
+                            return;
+                        }
+
+                        // ---- Normal teleop frame ----
+                        let position, orientation;
+                        if (isVRDevice) {
+                            teleopJoystick.handleControllerInput(session, frame);
+                            const ctrl = getRightControllerPose(session, frame, xrReferenceSpace);
+                            if (ctrl) {
+                                // Shift the streamed readout point to the wrist
+                                // pivot: pos + R(orientation)·offset.
+                                const q = [ctrl.orientation.x, ctrl.orientation.y, ctrl.orientation.z, ctrl.orientation.w];
+                                const offW = rotateVecByQuat(readoutOffset, q);
+                                position = { x: ctrl.position.x + offW[0], y: ctrl.position.y + offW[1], z: ctrl.position.z + offW[2] };
+                                orientation = ctrl.orientation;
                             } else {
                                 const viewerPose = frame.getViewerPose(xrReferenceSpace);
                                 if (viewerPose && viewerPose.views[0]) {
@@ -351,50 +579,50 @@
                                     orientation = viewerPose.views[0].transform.orientation;
                                 }
                             }
-
-                            if (position && orientation) {
-                                if (time - lastSendTime > 10) {
-                                    const teleopFrontEnd = (isVRDevice) ? teleopJoystick : teleopUI;
-                                    lastSendTime = time;
-                                    const state = {
-                                        position: {
-                                            x: position.x,
-                                            y: position.y,
-                                            z: position.z
-                                        },
-                                        orientation: {
-                                            x: orientation.x,
-                                            y: orientation.y,
-                                            z: orientation.z,
-                                            w: orientation.w
-                                        },
-                                        move: teleopFrontEnd.isMotionEnabled(),
-                                        gripper: teleopFrontEnd.isGripperEngaged() ? 'close' : 'open',
-                                        fps: fps,
-                                        scale: teleopFrontEnd.getScale(),
-                                        reservedButtonA: teleopFrontEnd.isReservedButtonAActive(),
-                                        reservedButtonB: teleopFrontEnd.isReservedButtonBActive(),
-                                        device: isVRDevice ? 'VR' : 'Phone',
-                                        message: message
-                                    }
-                                    sendPose(state);
-                                    teleopUI.updateLocalStats(state);
-                                }
-                            } else {
-                                setMessage('No pose available');
+                        } else {
+                            const viewerPose = frame.getViewerPose(xrReferenceSpace);
+                            if (viewerPose && viewerPose.views[0]) {
+                                position = viewerPose.views[0].transform.position;
+                                orientation = viewerPose.views[0].transform.orientation;
                             }
-                            session.requestAnimationFrame(onXRFrame);
                         }
-                        session.requestAnimationFrame(onXRFrame);
-                    }).catch((err) => {
-                        setMessage('Failed to request reference space: ' + err);
-                    });
+
+                        if (position && orientation) {
+                            if (time - lastSendTime > 10) {
+                                const teleopFrontEnd = isVRDevice ? teleopJoystick : teleopUI;
+                                lastSendTime = time;
+                                const state = {
+                                    position: { x: position.x, y: position.y, z: position.z },
+                                    orientation: { x: orientation.x, y: orientation.y, z: orientation.z, w: orientation.w },
+                                    move: teleopFrontEnd.isMotionEnabled(),
+                                    gripper: teleopFrontEnd.getGripper(),
+                                    fps: fps,
+                                    scale: teleopFrontEnd.getScale(),
+                                    reservedButtonA: teleopFrontEnd.isReservedButtonAActive(),
+                                    reservedButtonB: teleopFrontEnd.isReservedButtonBActive(),
+                                    device: isVRDevice ? 'VR' : 'Phone',
+                                    message: message
+                                };
+                                sendPose(state);
+                                teleopUI.updateLocalStats(state);
+                            }
+                        } else {
+                            setMessage('No pose available');
+                        }
+                    }
+                    session.requestAnimationFrame(onXRFrame);
                 }).catch((err) => {
-                    setMessage('Failed to start WebXR session: ' + err);
+                    setMessage('Failed to request reference space: ' + err);
                 });
-            } else {
-                setMessage('WebXR is not supported on this device');
-            }
+            }).catch((err) => {
+                setMessage('Failed to start WebXR session: ' + err);
+            });
+        }
+
+        startButtonDom.addEventListener('click', () => enterXR(false));
+        calibrateButtonDom.addEventListener('click', () => {
+            setMessage('Calibration: in VR, squeeze the grip and twist your wrist for 5s.');
+            enterXR(true);
         });
     </script>
 </body>
