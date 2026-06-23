@@ -1,6 +1,7 @@
 import os
 import math
 import socket
+import asyncio
 import logging
 from typing import Callable, List
 import uvicorn
@@ -187,6 +188,9 @@ class Teleop:
 
         self.__app = FastAPI()
         self.__manager = ConnectionManager()
+        # Captured on server startup so publish() can schedule broadcasts
+        # from the (separate) control-loop thread. None until run() starts.
+        self.__loop = None
 
         # Configure logging
         logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
@@ -200,6 +204,27 @@ class Teleop:
         - pose (np.ndarray): A 4x4 transformation matrix representing the pose.
         """
         self.__pose = pose
+
+    def publish(self, message: dict) -> None:
+        """
+        Send a JSON message to all connected browser clients (e.g. a haptic
+        cue: ``{"type": "haptic", "intensity": 0.5}``).
+
+        Safe to call from any thread: the broadcast is scheduled onto the
+        server's event loop. No-op until the server is running and at least
+        one startup has captured the loop.
+        """
+        loop = self.__loop
+        if loop is None:
+            return
+        try:
+            text = json.dumps(message)
+        except (TypeError, ValueError):
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self.__manager.broadcast(text), loop)
+        except Exception:
+            pass
 
     def subscribe(self, callback: Callable[[np.ndarray, dict], None]) -> None:
         """
@@ -288,6 +313,12 @@ class Teleop:
         # Mount static files directory
         assets_dir = os.path.join(self.__frontend_dir, "assets")
         self.__app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+        @self.__app.on_event("startup")
+        async def _capture_loop():
+            # Grab the running event loop so publish() (called from the
+            # control-loop thread) can schedule broadcasts onto it.
+            self.__loop = asyncio.get_running_loop()
 
         @self.__app.get("/")
         async def index():
