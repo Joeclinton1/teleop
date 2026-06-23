@@ -5,7 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Teleop</title>
-    <script src="/assets/teleop-ui.js?v=phone-axis-debug-2"></script>
+    <script src="/assets/teleop-ui.js?v=gripper-slider-1"></script>
 
     <style>
         * {
@@ -157,6 +157,10 @@
 
             getScale() {
                 return this.scale;
+            }
+
+            getGripper() {
+                return this.gripper === 'close' ? 1.0 : 0.0;
             }
         }
 
@@ -369,7 +373,7 @@
                                             w: orientation.w
                                         },
                                         move: teleopFrontEnd.isMotionEnabled(),
-                                        gripper: teleopFrontEnd.isGripperEngaged() ? 'close' : 'open',
+                                        gripper: teleopFrontEnd.getGripper(),
                                         fps: fps,
                                         scale: teleopFrontEnd.getScale(),
                                         reservedButtonA: teleopFrontEnd.isReservedButtonAActive(),
